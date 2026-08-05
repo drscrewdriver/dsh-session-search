@@ -21,7 +21,14 @@ import type {
 } from './types.js'
 
 /** Current derived-index schema version; incompatible versions reset in place. */
-export const SESSION_SEARCH_SCHEMA_VERSION = 1
+export const SESSION_SEARCH_SCHEMA_VERSION = 2
+
+/**
+ * What changed per schema version, so a bump can force a full reindex:
+ * - v2: dsh parsing decodes every concatenated zstd frame (v1 indexed dsh
+ *   sessions with zero messages); the version check wipes v1 indexes so the
+ *   rebuild repairs them instead of skipping unchanged artifacts.
+ */
 
 /** Owner-only creation of a missing database file. */
 function createDatabaseFile(path: string): void {
@@ -117,8 +124,16 @@ export class SessionSearchDb {
     this.ensureSchema()
   }
 
-  /** Create tables and the FTS5 index (idempotent). */
+  /** Create tables and the FTS5 index; wipe stale-version indexes first. */
   private ensureSchema(): void {
+    const version = (this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version
+    if (version < SESSION_SEARCH_SCHEMA_VERSION) {
+      // Derived index: rebuild from source artifacts instead of migrating,
+      // so parse/schema fixes reach already-indexed sessions.
+      this.db.exec('DROP TABLE IF EXISTS messages_fts')
+      this.db.exec('DROP TABLE IF EXISTS messages')
+      this.db.exec('DROP TABLE IF EXISTS sessions')
+    }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         source       TEXT NOT NULL,
@@ -355,7 +370,9 @@ export class SessionSearchDb {
     return {
       session,
       bestMatch,
-      snippet: (row.snippet as string | undefined) ?? clip(bestMatch.content),
+      // The LIKE branch selects '' AS snippet; only a real empty string must
+      // fall back to the clipped content.
+      snippet: typeof row.snippet === 'string' && row.snippet.length > 0 ? row.snippet : clip(bestMatch.content),
     }
   }
 

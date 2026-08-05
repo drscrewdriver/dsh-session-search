@@ -15,7 +15,7 @@ Full-text search uses SQLite FTS5 **trigram** tokenization: both English and Chi
 
 | Source | Default location | Read mode |
 |---|---|---|
-| dsh | `~/.dsh/sessions/**/session.jsonl.zstd` | zstd decompression (node:zlib native) |
+| dsh | `~/.dsh/sessions/**/session.jsonl.zstd` | multi-frame zstd, decoded frame by frame (node:zlib native) |
 | codex | `~/.codex/sessions/**` + `archived_sessions/` | JSONL |
 | claude | `~/.claude/projects/**` | JSONL |
 | pi | `~/.pi/agent/sessions/**` | JSONL |
@@ -70,9 +70,10 @@ peerDependencies are provided by the host dsh's node_modules (`cordis`, `@deepse
 ## Implementation notes
 
 - Parsers are defensive: oversized/corrupt/unreadable files are skipped without failing the whole index.
+- dsh session logs are **concatenated-frame zstd streams** (one independent frame per appended event batch): frame boundaries are located with a structural scan, then decoded one frame at a time; a torn final frame (interrupted write) is skipped and picked up by the next index pass.
 - Incremental indexing skips unchanged files by `(mtime, size)`; vanished sessions are cleaned up.
 - FTS sync is maintained explicitly by rowid (the FTS5 `'delete'` special command is unreliable on some SQLite builds).
-- Short queries (<3 searchable chars) fall back to LIKE exact matching.
+- Short queries (<3 searchable chars) fall back to LIKE exact matching; snippets fall back to the hit message body.
 
 ## License
 

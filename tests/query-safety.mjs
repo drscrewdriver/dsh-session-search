@@ -71,9 +71,15 @@ try {
   bestContents('中文-测试') // CJK with dash must not throw
 
   // LIKE fallback path (< 3 letter/number chars) stays literal too.
-  const quoteBest = bestContents('a"b')
+  const quoteHits = db.search({ query: 'a"b', limit: 10 })
+  const quoteBest = quoteHits.map(hit => hit.bestMatch.content)
   if (quoteBest.length !== 1 || quoteBest[0] !== 'say a"b loudly') {
     throw new Error(`query 'a"b' expected the quoted message, got ${JSON.stringify(quoteBest)}`)
+  }
+  // Short queries take the LIKE branch ('' AS snippet); the empty snippet
+  // must fall back to clipped content instead of returning ''.
+  if (quoteHits.length !== 1 || quoteHits[0].snippet.length === 0) {
+    throw new Error(`short-query snippet must fall back to content, got ${JSON.stringify(quoteHits[0]?.snippet)}`)
   }
 
   console.log('query-safety: all assertions passed')

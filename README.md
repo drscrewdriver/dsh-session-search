@@ -17,7 +17,7 @@
 
 | 源 | 位置（默认） | 读取方式 |
 |---|---|---|
-| dsh | `~/.dsh/sessions/**/session.jsonl.zstd` | zstd 解压（node:zlib 原生） |
+| dsh | `~/.dsh/sessions/**/session.jsonl.zstd` | 多帧 zstd 按帧解压（node:zlib 原生） |
 | codex | `~/.codex/sessions/**` + `archived_sessions/` | JSONL |
 | claude | `~/.claude/projects/**` | JSONL |
 | pi | `~/.pi/agent/sessions/**` | JSONL |
@@ -80,9 +80,10 @@ peerDependencies 由宿主 dsh 的 node_modules 提供（`cordis`、`@deepseek-a
 ## 实现要点
 
 - 解析器防御式处理：超大/损坏/不可读文件跳过，单文件失败不影响整体索引。
+- dsh 会话日志是**拼接帧 zstd 流**（每批事件一个独立帧）：先结构化扫描帧边界再逐帧解压；撕裂的末帧（写入中断）跳过，下次索引补上。
 - 增量索引：按 `(mtime, size)` 跳过未变文件；消失的会话自动清理。
 - FTS 同步显式按 rowid 维护（FTS5 `'delete'` 特殊命令在部分 SQLite 构建上不可靠）。
-- 短查询（<3 个可搜索字符）退化为 LIKE 精确匹配。
+- 短查询（<3 个可搜索字符）退化为 LIKE 精确匹配，snippet 回退为命中消息正文。
 
 ## License
 

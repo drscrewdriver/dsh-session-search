@@ -10,7 +10,7 @@
  */
 import type { AgentMessageRecord, AgentSearchHit, AgentSessionRecord, AgentSource } from './types.js';
 /** Current derived-index schema version; incompatible versions reset in place. */
-export declare const SESSION_SEARCH_SCHEMA_VERSION = 1;
+export declare const SESSION_SEARCH_SCHEMA_VERSION = 2;
 /** One search request against the index. */
 export interface SearchRequest {
     /** Full-text query, interpreted as data (never raw FTS syntax). */
@@ -38,7 +38,7 @@ export declare class SessionSearchDb {
     /** Serialized indexing pass; only one runs at a time. */
     private indexing;
     constructor(path: string, enabled: ReadonlySet<AgentSource>);
-    /** Create tables and the FTS5 index (idempotent). */
+    /** Create tables and the FTS5 index; wipe stale-version indexes first. */
     private ensureSchema;
     /** Serialize one indexing pass over the given artifact list. */
     index(artifacts: Array<{
