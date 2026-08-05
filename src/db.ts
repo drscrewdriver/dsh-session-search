@@ -381,7 +381,8 @@ export class SessionSearchDb {
           WITH matched AS (
             SELECT m.id, m.source, m.session_id, m.seq, m.msg_id, m.role, m.content, m.ts,
                    s.path, s.title, s.cwd, s.created_at, s.updated_at, s.msg_count, s.mtime, s.size,
-                   bm25(messages_fts) AS score
+                   bm25(messages_fts) AS score,
+                   snippet(messages_fts, 0, '[', ']', '…', ${SNIPPET_LEN}) AS snippet
             FROM messages_fts
             JOIN messages m ON m.id = messages_fts.rowid
             JOIN sessions s ON s.source = m.source AND s.session_id = m.session_id
@@ -394,7 +395,7 @@ export class SessionSearchDb {
             ) AS event_rank
             FROM matched
           )
-          SELECT *, '' AS snippet FROM ranked
+          SELECT * FROM ranked
           WHERE event_rank = 1
           ORDER BY ${orderSql}
           LIMIT ?
@@ -420,16 +421,6 @@ export class SessionSearchDb {
           ORDER BY ${orderSql}
           LIMIT ?
         `).all(query, ...roles, ...sources, ...cwdParams, this.maxMatchRows)
-
-    if (fts) {
-      const snippet = this.db.prepare(`
-        SELECT snippet(messages_fts, 0, '[', ']', '…', ${SNIPPET_LEN}) AS text
-        FROM messages_fts WHERE rowid = ? AND messages_fts MATCH ?
-      `)
-      for (const row of rows as Array<Record<string, unknown>>) {
-        row.snippet = (snippet.get(row.id as number, quoteFtsQuery(query)) as { text: string }).text
-      }
-    }
 
     const grouped: SearchHit[] = []
     for (const row of rows as Array<Record<string, unknown>>) {
