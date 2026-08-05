@@ -21,6 +21,8 @@ import type { AgentMessageRecord, AgentSource, ParsedSession } from './types.js'
 export const MAX_MSG_CHARS = 4000
 /** Per-file byte cap; larger artifacts are skipped entirely. */
 export const MAX_FILE_BYTES = 64 * 1024 * 1024
+/** Aggregate decompressed byte cap for one dsh artifact. */
+export const MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024
 /** Per-line byte cap; larger lines are skipped. */
 export const MAX_LINE_CHARS = 512 * 1024
 
@@ -65,23 +67,27 @@ function cap(s: string): string {
   return s.length > MAX_MSG_CHARS ? s.slice(0, MAX_MSG_CHARS) : s
 }
 
-/** Stream a JSONL file line by line with size guards; resolves false on any failure. */
-async function eachLine(path: string, fn: (line: string) => void): Promise<void> {
+/** Stream a JSONL file line by line with size guards. */
+async function eachLine(path: string, fn: (line: string) => boolean | void): Promise<boolean> {
   let st
   try {
     st = await stat(path)
   } catch {
-    return
+    return false
   }
-  if (st.size > MAX_FILE_BYTES) return
+  if (st.size > MAX_FILE_BYTES) return false
   const rl = createInterface({
     input: createReadStream(path, { encoding: 'utf8' }),
     crlfDelay: Infinity,
   })
   try {
-    for await (const line of rl) fn(line)
+    let valid = true
+    for await (const line of rl) {
+      if (fn(line) === false) valid = false
+    }
+    return valid
   } catch {
-    // unreadable file: skip
+    return false
   } finally {
     rl.close()
   }
@@ -198,6 +204,33 @@ export function scanZstdFrames(buffer: Buffer): ZstdFrameRange[] {
   return frames
 }
 
+/**
+ * Decode complete concatenated frames within one aggregate output budget.
+ * @param buffer - compressed dsh artifact bytes.
+ * @param maxOutputBytes - maximum aggregate decoded bytes.
+ * @returns decoded bytes in frame order.
+ */
+export function decompressZstdFrames(
+  buffer: Buffer,
+  maxOutputBytes = MAX_DECOMPRESSED_BYTES,
+): Buffer {
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1) {
+    throw new TypeError('dsh decompression budget must be a positive safe integer')
+  }
+  const chunks: Buffer[] = []
+  let outputBytes = 0
+  for (const frame of scanZstdFrames(buffer)) {
+    const remaining = maxOutputBytes - outputBytes
+    if (remaining < 1) throw new Error(`dsh session exceeds the ${maxOutputBytes}-byte decompression budget`)
+    const chunk = zstdDecompressSync(buffer.subarray(frame.start, frame.end), {
+      maxOutputLength: remaining,
+    })
+    outputBytes += chunk.byteLength
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks, outputBytes)
+}
+
 /** Chat event types whose text enters the transcript. */
 const DSH_CHAT_TYPES = new Set(['user/message', 'steering/message', 'assistant/message'])
 
@@ -219,27 +252,25 @@ function dshEventText(data: Record<string, unknown> | undefined): string {
  * so frames are located structurally and decoded one at a time. Logs are
  * small enough that sync decoding is fine for indexing.
  */
-export async function parseDsh(path: string): Promise<ParsedSession> {
+export async function parseDsh(path: string): Promise<ParsedSession | undefined> {
   let buffer: Buffer
   try {
     buffer = await readFile(path)
   } catch {
-    return parsed('dsh', path, basename(path).replace(/\.jsonl(\.zstd)?$/, ''), empty())
+    return undefined
   }
-  if (buffer.byteLength > MAX_FILE_BYTES) return parsed('dsh', path, basename(path), empty())
-  let text = ''
+  if (buffer.byteLength > MAX_FILE_BYTES) return undefined
+  let text: string
   try {
-    for (const frame of scanZstdFrames(buffer)) {
-      text += zstdDecompressSync(buffer.subarray(frame.start, frame.end)).toString('utf8')
-    }
+    text = decompressZstdFrames(buffer).toString('utf8')
   } catch {
-    return parsed('dsh', path, basename(path).replace(/\.jsonl(\.zstd)?$/, ''), empty())
+    return undefined
   }
   return parseDshLines(path, text)
 }
 
 /** Parse the decompressed dsh JSONL text. */
-function parseDshLines(path: string, text: string): ParsedSession {
+function parseDshLines(path: string, text: string): ParsedSession | undefined {
   const messages: AgentMessageRecord[] = []
   let sessionId = basename(path).replace(/\.jsonl(\.zstd)?$/, '')
   let cwd = ''
@@ -247,11 +278,20 @@ function parseDshLines(path: string, text: string): ParsedSession {
   let createdAt = 0
   let updatedAt = 0
   let seq = 0
+  let records = 0
+  let malformed = false
 
   for (const raw of text.split('\n')) {
     if (raw.length === 0) continue
     const d = asRecord(raw)
-    if (!d) continue
+    if (!d) {
+      malformed = true
+      continue
+    }
+    records += 1
+    const eventTs = typeof d.time === 'number' && Number.isFinite(d.time) ? d.time : 0
+    if (eventTs > updatedAt) updatedAt = eventTs
+    if (createdAt === 0 || (eventTs !== 0 && eventTs < createdAt)) createdAt = eventTs
     if (d.type === 'session') {
       if (typeof d.id === 'string') sessionId = d.id
       if (typeof d.cwd === 'string') cwd = d.cwd
@@ -264,20 +304,21 @@ function parseDshLines(path: string, text: string): ParsedSession {
       const text = dshEventText(data).trim()
       if (text.length === 0) continue
       const role: AgentMessageRecord['role'] = String(d.type) === 'assistant/message' ? 'assistant' : 'user'
-      const ts = typeof d.time === 'number' ? d.time : 0
-      if (ts > updatedAt) updatedAt = ts
-      if (createdAt === 0 || (ts !== 0 && ts < createdAt)) createdAt = ts
+      const ts = eventTs
       if (role === 'user' && title === '') title = text.slice(0, 80)
-      messages.push({ source: 'dsh', sessionId, seq: seq++, msgId: String(seq), role, content: cap(text), ts })
+      const messageSeq = seq++
+      const msgId = typeof d.seq === 'number' && Number.isSafeInteger(d.seq) ? String(d.seq) : String(messageSeq)
+      messages.push({ source: 'dsh', sessionId, seq: messageSeq, msgId, role, content: cap(text), ts })
     }
   }
+  if (malformed || records === 0) return undefined
   return parsed('dsh', path, sessionId, { title: title || 'dsh session', cwd, createdAt, updatedAt, messages })
 }
 
 // ------------------------------------------------------------------ codex
 
 /** Parse one Codex rollout JSONL. */
-export async function parseCodex(path: string): Promise<ParsedSession> {
+export async function parseCodex(path: string): Promise<ParsedSession | undefined> {
   const messages: AgentMessageRecord[] = []
   // The rollout filename is unique per artifact; payload.id is a logical
   // session id reused across rotation snapshots, so it must not key the index.
@@ -287,10 +328,12 @@ export async function parseCodex(path: string): Promise<ParsedSession> {
   let updatedAt = 0
   let seq = 0
   let firstUser = ''
+  let records = 0
 
-  await eachLine(path, (raw) => {
+  const complete = await eachLine(path, (raw) => {
     const d = asRecord(raw)
-    if (!d) return
+    if (!d) return false
+    records += 1
     const ts = tsOf(d.timestamp)
     if (ts > updatedAt) updatedAt = ts
     if (createdAt === 0 || (ts !== 0 && ts < createdAt)) createdAt = ts
@@ -309,6 +352,7 @@ export async function parseCodex(path: string): Promise<ParsedSession> {
       }
     }
   })
+  if (!complete || records === 0) return undefined
   return parsed('codex', path, sessionId, {
     title: firstUser || 'Codex session',
     cwd: cwd || 'unknown',
@@ -328,18 +372,20 @@ function decodeClaudeCwd(dirName: string): string {
 }
 
 /** Parse one Claude Code project transcript JSONL. */
-export async function parseClaude(path: string): Promise<ParsedSession> {
+export async function parseClaude(path: string): Promise<ParsedSession | undefined> {
   const messages: AgentMessageRecord[] = []
   let title = ''
   let createdAt = 0
   let updatedAt = 0
   let seq = 0
+  let records = 0
   const sessionId = basename(path).replace(/\.jsonl$/, '')
   const cwd = decodeClaudeCwd(dirname(path).split(/[\\/]/).pop() ?? '')
 
-  await eachLine(path, (raw) => {
+  const complete = await eachLine(path, (raw) => {
     const d = asRecord(raw)
-    if (!d) return
+    if (!d) return false
+    records += 1
     const ts = tsOf(d.timestamp)
     if (ts > updatedAt) updatedAt = ts
     if (createdAt === 0 || (ts !== 0 && ts < createdAt)) createdAt = ts
@@ -361,6 +407,7 @@ export async function parseClaude(path: string): Promise<ParsedSession> {
       })
     }
   })
+  if (!complete || records === 0) return undefined
   return parsed('claude', path, sessionId, {
     title: title || 'Claude Code session',
     cwd: cwd || 'unknown',
@@ -373,7 +420,7 @@ export async function parseClaude(path: string): Promise<ParsedSession> {
 // ------------------------------------------------------------------ pi
 
 /** Parse one pi session JSONL. */
-export async function parsePi(path: string): Promise<ParsedSession> {
+export async function parsePi(path: string): Promise<ParsedSession | undefined> {
   const messages: AgentMessageRecord[] = []
   let sessionId = basename(path).replace(/\.jsonl$/, '')
   let cwd = ''
@@ -381,10 +428,12 @@ export async function parsePi(path: string): Promise<ParsedSession> {
   let updatedAt = 0
   let seq = 0
   let firstUser = ''
+  let records = 0
 
-  await eachLine(path, (raw) => {
+  const complete = await eachLine(path, (raw) => {
     const d = asRecord(raw)
-    if (!d) return
+    if (!d) return false
+    records += 1
     const ts = tsOf(d.timestamp)
     if (ts > updatedAt) updatedAt = ts
     if (createdAt === 0 || (ts !== 0 && ts < createdAt)) createdAt = ts
@@ -413,6 +462,7 @@ export async function parsePi(path: string): Promise<ParsedSession> {
       })
     }
   })
+  if (!complete || records === 0) return undefined
   return parsed('pi', path, sessionId, {
     title: firstUser || 'pi session',
     cwd: cwd || 'unknown',
@@ -429,27 +479,26 @@ export async function parsePi(path: string): Promise<ParsedSession> {
  * one ParsedSession per `session` row; message text comes from `part` rows
  * with `data.type === 'text'`.
  */
-export function parseOpencodeDb(path: string): ParsedSession[] {
+export function parseOpencodeDb(path: string): ParsedSession[] | undefined {
   let db: DatabaseSync
   try {
     db = new DatabaseSync(path, { readOnly: true })
   } catch {
-    return []
+    return undefined
   }
   try {
     // Guard: only open when the expected tables exist.
     const hasTables = db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('session', 'message', 'part')",
     ).all() as Array<{ name: string }>
-    if (hasTables.length < 3) return []
+    if (hasTables.length < 3) return undefined
 
     const sessionRows = db.prepare(
       'SELECT id, directory, title, time_created, time_updated FROM session',
     ).all() as Array<{ id: string; directory: string | null; title: string | null; time_created: number; time_updated: number }>
 
-    const messagesBySession = new Map<string, AgentMessageRecord[]>()
     const partStmt = db.prepare(
-      "SELECT message_id, session_id, data FROM part WHERE session_id = ? ORDER BY time_created, id",
+      'SELECT message_id, data FROM part WHERE session_id = ? ORDER BY time_created, id',
     )
     const messageStmt = db.prepare(
       'SELECT id, session_id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created, id',
@@ -465,29 +514,32 @@ export function parseOpencodeDb(path: string): ParsedSession[] {
         time_created: number
         data: string
       }>
+      const partsByMessage = new Map<string, string[]>()
+      const partRows = partStmt.all(row.id) as Array<{ message_id: string; data: string }>
+      for (const part of partRows) {
+        let data: Record<string, unknown>
+        try {
+          data = JSON.parse(part.data) as Record<string, unknown>
+        } catch {
+          return undefined
+        }
+        if (typeof data !== 'object' || data === null || Array.isArray(data)) return undefined
+        if (data.type !== 'text' || typeof data.text !== 'string' || !data.text.trim()) continue
+        const parts = partsByMessage.get(part.message_id) ?? []
+        parts.push(data.text)
+        partsByMessage.set(part.message_id, parts)
+      }
       for (const msg of msgRows) {
         let data: Record<string, unknown> | null = null
         try {
           data = JSON.parse(msg.data) as Record<string, unknown>
         } catch {
-          continue
+          return undefined
         }
+        if (typeof data !== 'object' || data === null || Array.isArray(data)) return undefined
         const role = data.role === 'user' ? 'user' : data.role === 'assistant' ? 'assistant' : 'tool'
         const ts = msg.time_created
-        // Aggregate text parts for this message.
-        const partRows = partStmt.all(msg.session_id) as Array<{ data: string }>
-        const parts: string[] = []
-        for (const p of partRows) {
-          let pdata: Record<string, unknown> | null = null
-          try {
-            pdata = JSON.parse(p.data) as Record<string, unknown>
-          } catch {
-            continue
-          }
-          if (pdata.type === 'text' && typeof pdata.text === 'string' && pdata.text.trim()) {
-            parts.push(pdata.text)
-          }
-        }
+        const parts = partsByMessage.get(msg.id) ?? []
         const text = parts.join('\n').trim()
         if (text.length === 0) continue
         messages.push({
@@ -500,9 +552,7 @@ export function parseOpencodeDb(path: string): ParsedSession[] {
           ts,
         })
       }
-      if (messages.length === 0 && !sessionRows.some(r => r.id === row.id && r.title)) {
-        // keep only sessions with content or a title
-      }
+      if (messages.length === 0 && !row.title?.trim()) continue
       results.push(parsed('opencode', path, row.id, {
         title: row.title && row.title.trim() ? row.title.trim() : (messages[0]?.content.slice(0, 80) ?? 'opencode session'),
         cwd: row.directory ?? 'unknown',
@@ -512,6 +562,8 @@ export function parseOpencodeDb(path: string): ParsedSession[] {
       }))
     }
     return results
+  } catch {
+    return undefined
   } finally {
     db.close()
   }
@@ -519,25 +571,24 @@ export function parseOpencodeDb(path: string): ParsedSession[] {
 
 // ------------------------------------------------------------------ dispatch
 
-/** Empty parsed shell for unreadable artifacts. */
-function empty(): { title: string; cwd: string; createdAt: number; updatedAt: number; messages: AgentMessageRecord[] } {
-  return { title: '', cwd: '', createdAt: 0, updatedAt: 0, messages: [] }
-}
-
 /**
  * Parse one discovered artifact into one or more ParsedSessions.
  * @param source - source family of the artifact.
  * @param path - absolute artifact path.
- * @returns parsed sessions; opencode yields one per session row.
+ * @returns parsed sessions, or undefined when the artifact cannot be read completely.
  */
-export async function parseFile(source: AgentSource, path: string): Promise<ParsedSession[]> {
+export async function parseFile(source: AgentSource, path: string): Promise<ParsedSession[] | undefined> {
   switch (source) {
-    case 'dsh': return [await parseDsh(path)]
-    case 'codex': return [await parseCodex(path)]
-    case 'claude': return [await parseClaude(path)]
-    case 'pi': return [await parsePi(path)]
+    case 'dsh': return materializeSingle(await parseDsh(path))
+    case 'codex': return materializeSingle(await parseCodex(path))
+    case 'claude': return materializeSingle(await parseClaude(path))
+    case 'pi': return materializeSingle(await parsePi(path))
     case 'opencode': return parseOpencodeDb(path)
   }
+}
+
+function materializeSingle(value: ParsedSession | undefined): ParsedSession[] | undefined {
+  return value === undefined ? undefined : [value]
 }
 
 /** Whether this source is a single-database source (indexed as one artifact). */

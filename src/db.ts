@@ -200,6 +200,9 @@ export class SessionSearchDb {
     const rowState = this.db.prepare(
       'SELECT mtime, size FROM sessions WHERE source = ? AND session_id = ?',
     )
+    const artifactSessions = this.db.prepare(
+      'SELECT session_id FROM sessions WHERE source = ? AND path = ?',
+    )
 
     for (const artifact of artifacts) {
       if (!this.enabled.has(artifact.source)) continue
@@ -209,6 +212,11 @@ export class SessionSearchDb {
       const fileMtime = Math.round(st.mtimeMs)
 
       const parsedList = await parseFile(artifact.source, artifact.path)
+      if (parsedList === undefined) {
+        const retained = artifactSessions.all(artifact.source, artifact.path) as Array<{ session_id: string }>
+        for (const row of retained) seen.add(this.key(artifact.source, row.session_id))
+        continue
+      }
       for (const parsed of parsedList) {
         const session = parsed.session
         const state = rowState.get(session.source, session.sessionId) as { mtime: number; size: number } | undefined
