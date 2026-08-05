@@ -38,6 +38,8 @@ export interface Config {
     roots?: SourceRoots;
     /** Maximum sessions returned by one `agent_session_search` call. Defaults to 10. */
     maxResults?: number;
+    /** Maximum session-ranked database rows considered by one search. Defaults to 1000. */
+    maxMatchRows?: number;
     /** Window size for `agent_session_read` and search windows. Defaults to 10. */
     readWindow?: number;
     /** Re-index before each search so fresh sessions are visible. Defaults to true. */

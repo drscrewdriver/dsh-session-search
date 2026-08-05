@@ -25,19 +25,29 @@ export interface SearchRequest {
     limit: number;
     /** Ordering of the result sessions. */
     sort?: 'relevance' | 'newest' | 'oldest';
+    /** Number of messages returned around each best match. */
+    window?: number;
 }
 /** One search hit: session, strongest message, snippet, and window. */
 export interface SearchHit extends AgentSearchHit {
     /** Messages surrounding the best match, in seq order. */
     window: AgentMessageRecord[];
 }
+/** Database-owned resource bounds. */
+export interface SessionSearchDbOptions {
+    /** Maximum session-ranked rows materialized by one search. */
+    maxMatchRows?: number;
+}
+/** Default maximum number of session-ranked rows materialized by one search. */
+export declare const DEFAULT_MAX_MATCH_ROWS = 1000;
 /** Incremental index over discovered session artifacts. */
 export declare class SessionSearchDb {
     private readonly enabled;
     private readonly db;
+    private readonly maxMatchRows;
     /** Serialized indexing pass; only one runs at a time. */
     private indexing;
-    constructor(path: string, enabled: ReadonlySet<AgentSource>);
+    constructor(path: string, enabled: ReadonlySet<AgentSource>, options?: SessionSearchDbOptions);
     /** Create or migrate the derived index without dropping tables used by older live readers. */
     private ensureSchema;
     /** Serialize one indexing pass over the given artifact list. */

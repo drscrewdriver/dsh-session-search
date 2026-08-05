@@ -34,6 +34,7 @@ try {
     ['say a"b loudly', 'assistant'],
     ['prefix testing only', 'user'],
     ['test Tieboyh with space', 'assistant'],
+    ['Äx', 'user'],
   ]
   const insertMessage = seed.prepare(`
     INSERT INTO messages (source, session_id, seq, msg_id, role, content, ts)
@@ -80,6 +81,10 @@ try {
   // must fall back to clipped content instead of returning ''.
   if (quoteHits.length !== 1 || quoteHits[0].snippet.length === 0) {
     throw new Error(`short-query snippet must fall back to content, got ${JSON.stringify(quoteHits[0]?.snippet)}`)
+  }
+  const unicodeBest = bestContents('äx')
+  if (unicodeBest.length !== 1 || unicodeBest[0] !== 'Äx') {
+    throw new Error(`short Unicode query must use FTS-compatible case folding, got ${JSON.stringify(unicodeBest)}`)
   }
 
   console.log('query-safety: all assertions passed')

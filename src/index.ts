@@ -21,7 +21,7 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import { SessionSearchDb } from './db.js'
+import { DEFAULT_MAX_MATCH_ROWS, SessionSearchDb } from './db.js'
 import { discoverFiles, defaultRoots, type SourceRoots } from './discovery.js'
 import type { AgentSource } from './types.js'
 
@@ -52,6 +52,8 @@ export interface Config {
   roots?: SourceRoots
   /** Maximum sessions returned by one `agent_session_search` call. Defaults to 10. */
   maxResults?: number
+  /** Maximum session-ranked database rows considered by one search. Defaults to 1000. */
+  maxMatchRows?: number
   /** Window size for `agent_session_read` and search windows. Defaults to 10. */
   readWindow?: number
   /** Re-index before each search so fresh sessions are visible. Defaults to true. */
@@ -75,7 +77,8 @@ export const Config: z<Config> = z.object({
     pi: z.string(),
     opencode: z.string(),
   }),
-  maxResults: z.number().step(1).min(1).max(100).default(DEFAULT_MAX_RESULTS),
+    maxResults: z.number().step(1).min(1).max(100).default(DEFAULT_MAX_RESULTS),
+    maxMatchRows: z.number().step(1).min(1).max(100_000).default(DEFAULT_MAX_MATCH_ROWS),
   readWindow: z.number().step(1).min(1).max(50).default(DEFAULT_READ_WINDOW),
   indexOnSearch: z.boolean().default(true),
 })
@@ -85,6 +88,7 @@ interface ResolvedConfig {
   enabled: ReadonlySet<AgentSource>
   roots: SourceRoots
   maxResults: number
+  maxMatchRows: number
   readWindow: number
   indexOnSearch: boolean
 }
@@ -108,7 +112,9 @@ export function apply(ctx: Context, config: Config): void {
   let db: SessionSearchDb | null = null
 
   const getDb = (): SessionSearchDb => {
-    if (db === null) db = new SessionSearchDb(resolved.dbPath, resolved.enabled)
+    if (db === null) db = new SessionSearchDb(resolved.dbPath, resolved.enabled, {
+      maxMatchRows: resolved.maxMatchRows,
+    })
     return db
   }
 
@@ -145,15 +151,13 @@ export function apply(ctx: Context, config: Config): void {
     execute: async (args) => {
       await ensureIndexed()
       const query = typeof args.query === 'string' ? args.query : ''
-      const sources = Array.isArray(args.sources)
-        ? (args.sources as string[]).filter((s): s is AgentSource => SOURCE_IDS.includes(s as AgentSource))
-        : []
+      const sources = args.sources ?? []
       const sort = args.sort === 'newest' || args.sort === 'oldest' ? args.sort : 'relevance'
       const limit = typeof args.limit === 'number' && Number.isSafeInteger(args.limit) && args.limit > 0
         ? Math.min(args.limit, resolved.maxResults)
         : resolved.maxResults
       const cwd = typeof args.cwd === 'string' && args.cwd.length > 0 ? args.cwd : undefined
-      const hits = getDb().search({ query, sources, cwd, limit, sort })
+      const hits = getDb().search({ query, sources, cwd, limit, sort, window: resolved.readWindow })
       return JSON.stringify({
         query,
         count: hits.length,
@@ -191,8 +195,8 @@ export function apply(ctx: Context, config: Config): void {
     output: TEXT_OUTPUT,
     execute: async (args) => {
       await ensureIndexed()
-      const source = SOURCE_IDS.includes(args.source as AgentSource) ? args.source as AgentSource : 'dsh'
-      const sessionId = typeof args.sessionId === 'string' ? args.sessionId : ''
+      const source = args.source
+      const sessionId = args.sessionId
       const aroundSeq = typeof args.aroundSeq === 'number' && Number.isSafeInteger(args.aroundSeq)
         ? args.aroundSeq
         : undefined
@@ -232,6 +236,7 @@ function resolveConfig(config: Config): ResolvedConfig {
     enabled,
     roots: config.roots ?? {},
     maxResults: config.maxResults ?? DEFAULT_MAX_RESULTS,
+    maxMatchRows: config.maxMatchRows ?? DEFAULT_MAX_MATCH_ROWS,
     readWindow: config.readWindow ?? DEFAULT_READ_WINDOW,
     indexOnSearch: config.indexOnSearch ?? true,
   }

@@ -57,6 +57,8 @@ export interface SearchRequest {
   limit: number
   /** Ordering of the result sessions. */
   sort?: 'relevance' | 'newest' | 'oldest'
+  /** Number of messages returned around each best match. */
+  window?: number
 }
 
 /** One search hit: session, strongest message, snippet, and window. */
@@ -73,6 +75,12 @@ interface ArtifactPlan {
   sessions: ParsedSession[]
 }
 
+/** Database-owned resource bounds. */
+export interface SessionSearchDbOptions {
+  /** Maximum session-ranked rows materialized by one search. */
+  maxMatchRows?: number
+}
+
 /** Count searchable (letter/number) characters; trigram needs >= 3. */
 function searchableChars(q: string): number {
   let n = 0
@@ -80,11 +88,6 @@ function searchableChars(q: string): number {
     if (/[\p{L}\p{N}]/u.test(ch)) n++
   }
   return n
-}
-
-/** Escape LIKE wildcards so user input matches literally. */
-function escapeLike(s: string): string {
-  return s.replace(/[\\%_]/g, (c) => `\\${c}`)
 }
 
 /**
@@ -105,9 +108,10 @@ function quoteFtsQuery(query: string): string {
 
 /** FTS5 snippet length in tokens. */
 const SNIPPET_LEN = 18
-/** Messages returned around a hit. */
-const WINDOW_BEFORE = 2
-const WINDOW_AFTER = 4
+/** Default maximum number of session-ranked rows materialized by one search. */
+export const DEFAULT_MAX_MATCH_ROWS = 1000
+/** Default messages returned around a hit. */
+const DEFAULT_WINDOW = 10
 /** Per-message truncation when returning to the model. */
 const MSG_RETURN_CHARS = 350
 
@@ -118,13 +122,20 @@ function clip(content: string): string {
 /** Incremental index over discovered session artifacts. */
 export class SessionSearchDb {
   private readonly db: DatabaseSync
+  private readonly maxMatchRows: number
   /** Serialized indexing pass; only one runs at a time. */
   private indexing: Promise<number> | null = null
 
   constructor(
     path: string,
     private readonly enabled: ReadonlySet<AgentSource>,
+    options: SessionSearchDbOptions = {},
   ) {
+    const maxMatchRows = options.maxMatchRows ?? DEFAULT_MAX_MATCH_ROWS
+    if (!Number.isSafeInteger(maxMatchRows) || maxMatchRows < 1) {
+      throw new TypeError('session-search maxMatchRows must be a positive safe integer')
+    }
+    this.maxMatchRows = maxMatchRows
     const actual = resolve(path)
     mkdirSync(dirname(actual), { recursive: true, mode: 0o700 })
     createDatabaseFile(actual)
@@ -132,6 +143,10 @@ export class SessionSearchDb {
     this.db.exec('PRAGMA journal_mode = WAL')
     this.db.exec('PRAGMA synchronous = NORMAL')
     this.db.exec('PRAGMA busy_timeout = 5000')
+    this.db.function('unicode_contains', { deterministic: true }, (value: unknown, needle: unknown) => {
+      if (typeof value !== 'string' || typeof needle !== 'string') return 0
+      return value.toLowerCase().includes(needle.toLowerCase()) ? 1 : 0
+    })
     this.ensureSchema()
   }
 
@@ -352,48 +367,77 @@ export class SessionSearchDb {
     const sources = request.sources ?? []
     const roleSql = roles.map(() => '?').join(',')
     const sourceSql = sources.length > 0 ? sources.map(() => '?').join(',') : ''
-    const like = `%${escapeLike(query)}%`
+    const cwdSql = request.cwd !== undefined && request.cwd.length > 0 ? 'AND unicode_contains(s.cwd, ?) = 1' : ''
+    const cwdParams = cwdSql.length > 0 ? [request.cwd as string] : []
+    const orderSql = request.sort === 'newest'
+      ? 'updated_at DESC, score ASC, ts DESC'
+      : request.sort === 'oldest'
+        ? 'updated_at ASC, score ASC, ts DESC'
+        : 'score ASC, ts DESC'
+    const fts = searchableChars(query) >= 3
 
-    const rows = searchableChars(query) >= 3
+    const rows = fts
       ? this.db.prepare(`
-          SELECT m.id, m.source, m.session_id, m.seq, m.msg_id, m.role, m.content, m.ts,
-                 s.path, s.title, s.cwd, s.created_at, s.updated_at, s.msg_count, s.mtime, s.size,
-                 snippet(messages_fts, 0, '[', ']', '…', ${SNIPPET_LEN}) AS snippet
-          FROM messages_fts
-          JOIN messages m ON m.id = messages_fts.rowid
-          JOIN sessions s ON s.source = m.source AND s.session_id = m.session_id
-          WHERE messages_fts MATCH ? AND m.role IN (${roleSql})
-            ${sourceSql.length > 0 ? `AND m.source IN (${sourceSql})` : ''}
-          ORDER BY bm25(messages_fts), m.ts DESC
-        `).all(quoteFtsQuery(query), ...roles, ...sources)
+          WITH matched AS (
+            SELECT m.id, m.source, m.session_id, m.seq, m.msg_id, m.role, m.content, m.ts,
+                   s.path, s.title, s.cwd, s.created_at, s.updated_at, s.msg_count, s.mtime, s.size,
+                   bm25(messages_fts) AS score
+            FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            JOIN sessions s ON s.source = m.source AND s.session_id = m.session_id
+            WHERE messages_fts MATCH ? AND m.role IN (${roleSql})
+              ${sourceSql.length > 0 ? `AND m.source IN (${sourceSql})` : ''}
+              ${cwdSql}
+          ), ranked AS (
+            SELECT *, ROW_NUMBER() OVER (
+              PARTITION BY source, session_id ORDER BY score ASC, ts DESC, seq DESC
+            ) AS event_rank
+            FROM matched
+          )
+          SELECT *, '' AS snippet FROM ranked
+          WHERE event_rank = 1
+          ORDER BY ${orderSql}
+          LIMIT ?
+        `).all(quoteFtsQuery(query), ...roles, ...sources, ...cwdParams, this.maxMatchRows)
       : this.db.prepare(`
-          SELECT m.id, m.source, m.session_id, m.seq, m.msg_id, m.role, m.content, m.ts,
-                 s.path, s.title, s.cwd, s.created_at, s.updated_at, s.msg_count, s.mtime, s.size,
-                 '' AS snippet
-          FROM messages m
-          JOIN sessions s ON s.source = m.source AND s.session_id = m.session_id
-          WHERE m.content LIKE ? ESCAPE '\\' AND m.role IN (${roleSql})
-            ${sourceSql.length > 0 ? `AND m.source IN (${sourceSql})` : ''}
-          ORDER BY m.ts DESC
-        `).all(like, ...roles, ...sources)
+          WITH matched AS (
+            SELECT m.id, m.source, m.session_id, m.seq, m.msg_id, m.role, m.content, m.ts,
+                   s.path, s.title, s.cwd, s.created_at, s.updated_at, s.msg_count, s.mtime, s.size,
+                   0 AS score
+            FROM messages m
+            JOIN sessions s ON s.source = m.source AND s.session_id = m.session_id
+            WHERE unicode_contains(m.content, ?) = 1 AND m.role IN (${roleSql})
+              ${sourceSql.length > 0 ? `AND m.source IN (${sourceSql})` : ''}
+              ${cwdSql}
+          ), ranked AS (
+            SELECT *, ROW_NUMBER() OVER (
+              PARTITION BY source, session_id ORDER BY ts DESC, seq DESC
+            ) AS event_rank
+            FROM matched
+          )
+          SELECT *, '' AS snippet FROM ranked
+          WHERE event_rank = 1
+          ORDER BY ${orderSql}
+          LIMIT ?
+        `).all(query, ...roles, ...sources, ...cwdParams, this.maxMatchRows)
 
-    const bySession = new Map<string, SearchHit>()
-    for (const row of rows as Array<Record<string, unknown>>) {
-      const hit = this.hitFromRow(row)
-      const key = this.key(hit.session.source, hit.session.sessionId)
-      if (!bySession.has(key)) {
-        bySession.set(key, { ...hit, window: this.windowAround(hit.session, hit.bestMatch.seq) })
+    if (fts) {
+      const snippet = this.db.prepare(`
+        SELECT snippet(messages_fts, 0, '[', ']', '…', ${SNIPPET_LEN}) AS text
+        FROM messages_fts WHERE rowid = ? AND messages_fts MATCH ?
+      `)
+      for (const row of rows as Array<Record<string, unknown>>) {
+        row.snippet = (snippet.get(row.id as number, quoteFtsQuery(query)) as { text: string }).text
       }
     }
-    let grouped = [...bySession.values()]
-    if (request.sort === 'newest') {
-      grouped.sort((a, b) => b.session.updatedAt - a.session.updatedAt)
-    } else if (request.sort === 'oldest') {
-      grouped.sort((a, b) => a.session.updatedAt - b.session.updatedAt)
-    }
-    if (request.cwd !== undefined && request.cwd.length > 0) {
-      const needle = request.cwd.toLowerCase()
-      grouped = grouped.filter(hit => hit.session.cwd.toLowerCase().includes(needle))
+
+    const grouped: SearchHit[] = []
+    for (const row of rows as Array<Record<string, unknown>>) {
+      const hit = this.hitFromRow(row)
+      grouped.push({
+        ...hit,
+        window: this.windowAround(hit.session, hit.bestMatch.seq, request.window ?? DEFAULT_WINDOW),
+      })
     }
     return grouped.slice(0, request.limit)
   }
@@ -455,13 +499,11 @@ export class SessionSearchDb {
   }
 
   /** Messages around a message seq within a session. */
-  private windowAround(session: AgentSessionRecord, seq: number): AgentMessageRecord[] {
+  private windowAround(session: AgentSessionRecord, seq: number, window: number): AgentMessageRecord[] {
     const messages = this.sessionMessages(session.source, session.sessionId)
     const index = messages.findIndex(m => m.seq === seq)
     if (index < 0) return []
-    const start = Math.max(0, index - WINDOW_BEFORE)
-    const end = Math.min(messages.length, index + WINDOW_AFTER + 1)
-    return messages.slice(start, end)
+    return centeredWindow(messages, index, window)
   }
 
   /** Read one session's metadata and a message window. */
@@ -491,9 +533,7 @@ export class SessionSearchDb {
     if (aroundSeq === undefined) return { session, messages: messages.slice(-window) }
     const index = messages.findIndex(m => m.seq === aroundSeq)
     if (index < 0) return { session, messages: messages.slice(-window) }
-    const start = Math.max(0, index - WINDOW_BEFORE)
-    const end = Math.min(messages.length, index + WINDOW_AFTER + 1)
-    return { session, messages: messages.slice(start, end) }
+    return { session, messages: centeredWindow(messages, index, window) }
   }
 
   /** List sessions in the index, newest first. */
@@ -519,4 +559,13 @@ export class SessionSearchDb {
   close(): void {
     this.db.close()
   }
+}
+
+function centeredWindow<T>(values: readonly T[], index: number, requested: number): T[] {
+  const size = Number.isSafeInteger(requested) && requested > 0 ? requested : DEFAULT_WINDOW
+  const before = Math.floor((size - 1) / 2)
+  let start = Math.max(0, index - before)
+  const end = Math.min(values.length, start + size)
+  start = Math.max(0, end - size)
+  return values.slice(start, end)
 }
