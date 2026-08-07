@@ -2,12 +2,12 @@
  * Shared types for the cross-agent session search plugin.
  *
  * Every source (dsh, codex, claude, pi, opencode) is normalized into the same
- * two records: one per session file, one per extractable message. The index
- * stores exactly these shapes; tools render them back to the model.
+ * two records: one per session file, one per extractable message. The direct
+ * scanner searches these shapes and renders them back to the model.
  * @module @dsh-external/dsh-session-search/types
  */
 
-/** One session-file source family supported by the index. */
+/** One session-file source family supported by the scanner. */
 export type AgentSource = 'dsh' | 'codex' | 'claude' | 'pi' | 'opencode'
 
 /** Normalized session metadata extracted from one source file. */
@@ -26,11 +26,11 @@ export interface AgentSessionRecord {
   createdAt: number
   /** Last observed event time in Unix epoch milliseconds; 0 when unknown. */
   updatedAt: number
-  /** Number of indexed messages from this session. */
+  /** Number of searchable messages from this session. */
   messageCount: number
-  /** Artifact size in bytes at index time. */
+  /** Artifact size in bytes when parsed. */
   size: number
-  /** Artifact mtime in Unix epoch milliseconds at index time. */
+  /** Artifact mtime in Unix epoch milliseconds when parsed. */
   mtime: number
 }
 
@@ -46,7 +46,7 @@ export interface AgentMessageRecord {
   msgId: string
   /** Model-facing role label. */
   role: 'user' | 'assistant' | 'tool'
-  /** Extracted text content (indexed by FTS5). */
+  /** Extracted text content searched by the direct scanner. */
   content: string
   /** Message time in Unix epoch milliseconds; 0 when unknown. */
   ts: number
@@ -60,13 +60,13 @@ export interface ParsedSession {
   messages: AgentMessageRecord[]
 }
 
-/** One full-text hit grouped by its owning session. */
+/** One literal-text hit grouped by its owning session. */
 export interface AgentSearchHit {
   /** Session metadata of the hit. */
   session: AgentSessionRecord
   /** Strongest matching message within the session. */
   bestMatch: AgentMessageRecord
-  /** FTS5 highlight snippet around the match. */
+  /** Bounded excerpt around the literal match. */
   snippet: string
   /** Messages surrounding the match (bookend window). */
   window: AgentMessageRecord[]

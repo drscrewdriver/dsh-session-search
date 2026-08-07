@@ -13,11 +13,12 @@ import { readFile, stat } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { zstdDecompressSync } from 'node:zlib'
+import { StringDecoder } from 'node:string_decoder'
 import { DatabaseSync } from 'node:sqlite'
 import { basename, dirname } from 'node:path'
 import type { AgentMessageRecord, AgentSource, ParsedSession } from './types.js'
 
-/** Per-message content cap kept in the index (long tool dumps stay out). */
+/** Per-message content cap kept for search (long tool dumps stay out). */
 export const MAX_MSG_CHARS = 4000
 /** Per-file byte cap; larger artifacts are skipped entirely. */
 export const MAX_FILE_BYTES = 64 * 1024 * 1024
@@ -62,7 +63,7 @@ function extractText(content: unknown): string {
   return parts.join('\n')
 }
 
-/** Cap a message body for index storage. */
+/** Cap a message body before it enters the searchable transcript. */
 function cap(s: string): string {
   return s.length > MAX_MSG_CHARS ? s.slice(0, MAX_MSG_CHARS) : s
 }
@@ -116,7 +117,7 @@ function parsed(
       createdAt: fields.createdAt,
       updatedAt: fields.updatedAt,
       messageCount: fields.messages.length,
-      size: 0, // filled by the indexer after stat
+      size: 0, // filled by the scanner after stat
       mtime: 0,
     },
     messages: fields.messages,
@@ -142,8 +143,8 @@ interface ZstdFrameRange {
  * independently compressed frame appended to the same file; the structural
  * scan mirrors `scanZstdFrames()` in `dsh-session-persistence-jsonl`, which
  * owns that container format. Invalid complete structure throws; EOF inside
- * the final frame omits that torn frame (an incomplete write the next index
- * pass picks up).
+ * the final frame omits that torn frame (a later scan can observe it after
+ * the source finishes writing).
  * @param buffer - complete bytes of the session artifact.
  * @returns complete frame ranges in file order.
  */
@@ -250,7 +251,8 @@ function dshEventText(data: Record<string, unknown> | undefined): string {
  * batch as its own independently compressed zstd frame to the same file, and
  * Node's decompressor only decodes the first frame of a concatenated stream —
  * so frames are located structurally and decoded one at a time. Logs are
- * small enough that sync decoding is fine for indexing.
+ * Frames are decoded and consumed one at a time so a large session does not
+ * materialize its complete decompressed log.
  */
 export async function parseDsh(path: string): Promise<ParsedSession | undefined> {
   let buffer: Buffer
@@ -260,59 +262,110 @@ export async function parseDsh(path: string): Promise<ParsedSession | undefined>
     return undefined
   }
   if (buffer.byteLength > MAX_FILE_BYTES) return undefined
-  let text: string
   try {
-    text = decompressZstdFrames(buffer).toString('utf8')
+    const state = createDshState(path)
+    const decoder = new StringDecoder('utf8')
+    let carry = ''
+    let outputBytes = 0
+    for (const frame of scanZstdFrames(buffer)) {
+      const remaining = MAX_DECOMPRESSED_BYTES - outputBytes
+      if (remaining < 1) return undefined
+      const chunk = zstdDecompressSync(buffer.subarray(frame.start, frame.end), {
+        maxOutputLength: remaining,
+      })
+      outputBytes += chunk.byteLength
+      const lines = `${carry}${decoder.write(chunk)}`.split('\n')
+      carry = lines.pop() ?? ''
+      for (const line of lines) consumeDshLine(state, line)
+    }
+    carry += decoder.end()
+    if (carry.length > 0) consumeDshLine(state, carry)
+    return finishDshState(state)
   } catch {
     return undefined
   }
-  return parseDshLines(path, text)
 }
 
 /** Parse the decompressed dsh JSONL text. */
 function parseDshLines(path: string, text: string): ParsedSession | undefined {
-  const messages: AgentMessageRecord[] = []
-  let sessionId = basename(path).replace(/\.jsonl(\.zstd)?$/, '')
-  let cwd = ''
-  let title = ''
-  let createdAt = 0
-  let updatedAt = 0
-  let seq = 0
-  let records = 0
-  let malformed = false
-
+  const state = createDshState(path)
   for (const raw of text.split('\n')) {
-    if (raw.length === 0) continue
-    const d = asRecord(raw)
-    if (!d) {
-      malformed = true
-      continue
-    }
-    records += 1
-    const eventTs = typeof d.time === 'number' && Number.isFinite(d.time) ? d.time : 0
-    if (eventTs > updatedAt) updatedAt = eventTs
-    if (createdAt === 0 || (eventTs !== 0 && eventTs < createdAt)) createdAt = eventTs
-    if (d.type === 'session') {
-      if (typeof d.id === 'string') sessionId = d.id
-      if (typeof d.cwd === 'string') cwd = d.cwd
-      if (typeof d.createdAt === 'number') createdAt = d.createdAt
-    } else if (d.type === 'session/title' && typeof d.data === 'object') {
-      const data = d.data as Record<string, unknown>
-      if (typeof data.title === 'string' && data.title.trim().length > 0) title = data.title.trim()
-    } else if (DSH_CHAT_TYPES.has(String(d.type))) {
-      const data = d.data as Record<string, unknown> | undefined
-      const text = dshEventText(data).trim()
-      if (text.length === 0) continue
-      const role: AgentMessageRecord['role'] = String(d.type) === 'assistant/message' ? 'assistant' : 'user'
-      const ts = eventTs
-      if (role === 'user' && title === '') title = text.slice(0, 80)
-      const messageSeq = seq++
-      const msgId = typeof d.seq === 'number' && Number.isSafeInteger(d.seq) ? String(d.seq) : String(messageSeq)
-      messages.push({ source: 'dsh', sessionId, seq: messageSeq, msgId, role, content: cap(text), ts })
-    }
+    consumeDshLine(state, raw)
   }
-  if (malformed || records === 0) return undefined
-  return parsed('dsh', path, sessionId, { title: title || 'dsh session', cwd, createdAt, updatedAt, messages })
+  return finishDshState(state)
+}
+
+interface DshParseState {
+  path: string
+  messages: AgentMessageRecord[]
+  sessionId: string
+  cwd: string
+  title: string
+  createdAt: number
+  updatedAt: number
+  seq: number
+  records: number
+  malformed: boolean
+}
+
+function createDshState(path: string): DshParseState {
+  return {
+    path,
+    messages: [],
+    sessionId: basename(path).replace(/\.jsonl(\.zstd)?$/, ''),
+    cwd: '',
+    title: '',
+    createdAt: 0,
+    updatedAt: 0,
+    seq: 0,
+    records: 0,
+    malformed: false,
+  }
+}
+
+function consumeDshLine(state: DshParseState, raw: string): void {
+  if (raw.length === 0) return
+  const d = asRecord(raw)
+  if (!d) {
+    state.malformed = true
+    return
+  }
+  state.records += 1
+  const eventTs = typeof d.time === 'number' && Number.isFinite(d.time) ? d.time : 0
+  if (eventTs > state.updatedAt) state.updatedAt = eventTs
+  if (state.createdAt === 0 || (eventTs !== 0 && eventTs < state.createdAt)) state.createdAt = eventTs
+  if (d.type === 'session') {
+    if (typeof d.id === 'string') state.sessionId = d.id
+    if (typeof d.cwd === 'string') state.cwd = d.cwd
+    if (typeof d.createdAt === 'number') state.createdAt = d.createdAt
+  } else if (d.type === 'session/title' && typeof d.data === 'object') {
+    const data = d.data as Record<string, unknown>
+    if (typeof data.title === 'string' && data.title.trim().length > 0) state.title = data.title.trim()
+  } else if (DSH_CHAT_TYPES.has(String(d.type))) {
+    const data = d.data as Record<string, unknown> | undefined
+    const text = dshEventText(data).trim()
+    if (text.length === 0) return
+    const role: AgentMessageRecord['role'] = String(d.type) === 'assistant/message' ? 'assistant' : 'user'
+    if (role === 'user' && state.title === '') state.title = text.slice(0, 80)
+    const messageSeq = state.seq++
+    const msgId = typeof d.seq === 'number' && Number.isSafeInteger(d.seq) ? String(d.seq) : String(messageSeq)
+    state.messages.push({
+      source: 'dsh', sessionId: state.sessionId, seq: messageSeq, msgId, role,
+      content: cap(text), ts: eventTs,
+    })
+  }
+}
+
+function finishDshState(state: DshParseState): ParsedSession | undefined {
+  if (state.malformed || state.records === 0) return undefined
+  for (const message of state.messages) message.sessionId = state.sessionId
+  return parsed('dsh', state.path, state.sessionId, {
+    title: state.title || 'dsh session',
+    cwd: state.cwd,
+    createdAt: state.createdAt,
+    updatedAt: state.updatedAt,
+    messages: state.messages,
+  })
 }
 
 // ------------------------------------------------------------------ codex
@@ -321,7 +374,7 @@ function parseDshLines(path: string, text: string): ParsedSession | undefined {
 export async function parseCodex(path: string): Promise<ParsedSession | undefined> {
   const messages: AgentMessageRecord[] = []
   // The rollout filename is unique per artifact; payload.id is a logical
-  // session id reused across rotation snapshots, so it must not key the index.
+  // session id reused across rotation snapshots, so it must not key search results.
   const sessionId = basename(path).replace(/\.jsonl$/, '')
   let cwd = ''
   let createdAt = 0
@@ -475,27 +528,43 @@ export async function parsePi(path: string): Promise<ParsedSession | undefined> 
 // ------------------------------------------------------------------ opencode
 
 /**
- * Parse all sessions from one OpenCode SQLite database (read-only). Returns
- * one ParsedSession per `session` row; message text comes from `part` rows
- * with `data.type === 'text'`.
+ * Visit sessions from one OpenCode SQLite database without retaining the
+ * complete source in memory. Message text comes from `part` rows with
+ * `data.type === 'text'`.
+ * @param path - OpenCode database path.
+ * @param visit - synchronous consumer invoked once per valid session.
+ * @param sessionId - optional exact session restriction.
+ * @returns false when the database cannot be read completely.
  */
-export function parseOpencodeDb(path: string): ParsedSession[] | undefined {
+export function visitOpencodeDb(
+  path: string,
+  visit: (session: ParsedSession) => void,
+  sessionId?: string,
+): boolean {
   let db: DatabaseSync
   try {
     db = new DatabaseSync(path, { readOnly: true })
   } catch {
-    return undefined
+    return false
   }
   try {
     // Guard: only open when the expected tables exist.
     const hasTables = db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('session', 'message', 'part')",
     ).all() as Array<{ name: string }>
-    if (hasTables.length < 3) return undefined
+    if (hasTables.length < 3) return false
 
-    const sessionRows = db.prepare(
-      'SELECT id, directory, title, time_created, time_updated FROM session',
-    ).all() as Array<{ id: string; directory: string | null; title: string | null; time_created: number; time_updated: number }>
+    const sessionStatement = db.prepare(sessionId === undefined
+      ? 'SELECT id, directory, title, time_created, time_updated FROM session'
+      : 'SELECT id, directory, title, time_created, time_updated FROM session WHERE id = ?'
+    )
+    const sessionRows = (sessionId === undefined ? sessionStatement.all() : sessionStatement.all(sessionId)) as Array<{
+      id: string
+      directory: string | null
+      title: string | null
+      time_created: number
+      time_updated: number
+    }>
 
     const partStmt = db.prepare(
       'SELECT message_id, data FROM part WHERE session_id = ? ORDER BY time_created, id',
@@ -504,7 +573,6 @@ export function parseOpencodeDb(path: string): ParsedSession[] | undefined {
       'SELECT id, session_id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created, id',
     )
 
-    const results: ParsedSession[] = []
     for (const row of sessionRows) {
       const messages: AgentMessageRecord[] = []
       let seq = 0
@@ -521,9 +589,9 @@ export function parseOpencodeDb(path: string): ParsedSession[] | undefined {
         try {
           data = JSON.parse(part.data) as Record<string, unknown>
         } catch {
-          return undefined
+          return false
         }
-        if (typeof data !== 'object' || data === null || Array.isArray(data)) return undefined
+        if (typeof data !== 'object' || data === null || Array.isArray(data)) return false
         if (data.type !== 'text' || typeof data.text !== 'string' || !data.text.trim()) continue
         const parts = partsByMessage.get(part.message_id) ?? []
         parts.push(data.text)
@@ -534,9 +602,9 @@ export function parseOpencodeDb(path: string): ParsedSession[] | undefined {
         try {
           data = JSON.parse(msg.data) as Record<string, unknown>
         } catch {
-          return undefined
+          return false
         }
-        if (typeof data !== 'object' || data === null || Array.isArray(data)) return undefined
+        if (typeof data !== 'object' || data === null || Array.isArray(data)) return false
         const role = data.role === 'user' ? 'user' : data.role === 'assistant' ? 'assistant' : 'tool'
         const ts = msg.time_created
         const parts = partsByMessage.get(msg.id) ?? []
@@ -553,7 +621,7 @@ export function parseOpencodeDb(path: string): ParsedSession[] | undefined {
         })
       }
       if (messages.length === 0 && !row.title?.trim()) continue
-      results.push(parsed('opencode', path, row.id, {
+      visit(parsed('opencode', path, row.id, {
         title: row.title && row.title.trim() ? row.title.trim() : (messages[0]?.content.slice(0, 80) ?? 'opencode session'),
         cwd: row.directory ?? 'unknown',
         createdAt: row.time_created ?? 0,
@@ -561,12 +629,24 @@ export function parseOpencodeDb(path: string): ParsedSession[] | undefined {
         messages,
       }))
     }
-    return results
+    return true
   } catch {
-    return undefined
+    return false
   } finally {
     db.close()
   }
+}
+
+/** Parse all OpenCode sessions for compatibility with artifact consumers. */
+export function parseOpencodeDb(path: string): ParsedSession[] | undefined {
+  const results: ParsedSession[] = []
+  return visitOpencodeDb(path, session => results.push(session)) ? results : undefined
+}
+
+/** Parse one exact OpenCode session without materializing its peers. */
+export function parseOpencodeSession(path: string, sessionId: string): ParsedSession | undefined {
+  let result: ParsedSession | undefined
+  return visitOpencodeDb(path, session => { result = session }, sessionId) ? result : undefined
 }
 
 // ------------------------------------------------------------------ dispatch
@@ -591,7 +671,7 @@ function materializeSingle(value: ParsedSession | undefined): ParsedSession[] | 
   return value === undefined ? undefined : [value]
 }
 
-/** Whether this source is a single-database source (indexed as one artifact). */
+/** Whether this source is a single-database source (discovered as one artifact). */
 export function isDatabaseSource(source: AgentSource): boolean {
   return source === 'opencode'
 }

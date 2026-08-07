@@ -1,11 +1,10 @@
 #!/usr/bin/env node
-/** Parser isolation and failed-artifact retention regressions. */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+/** Parser isolation regressions. */
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { SessionSearchDb } from '../lib/db.js'
-import { parseOpencodeDb } from '../lib/parsers.js'
+import { parseOpencodeDb, parseOpencodeSession } from '../lib/parsers.js'
 
 const dir = mkdtempSync(join(tmpdir(), 'dsh-session-search-parser-'))
 try {
@@ -38,19 +37,10 @@ try {
   if (contents[0] !== 'only message one' || contents[1] !== 'only message two') {
     throw new Error(`OpenCode message parts crossed message boundaries: ${JSON.stringify(contents)}`)
   }
-
-  const codexPath = join(dir, 'rollout-retained.jsonl')
-  writeFileSync(codexPath, [
-    JSON.stringify({ type: 'session_meta', timestamp: '2026-01-01T00:00:00Z', payload: { cwd: '/work' } }),
-    JSON.stringify({ type: 'event_msg', timestamp: '2026-01-01T00:00:01Z', payload: { type: 'user_message', message: 'retain this text' } }),
-  ].join('\n'))
-  const index = new SessionSearchDb(join(dir, 'index.db'), new Set(['codex']))
-  await index.index([{ source: 'codex', path: codexPath }])
-  writeFileSync(codexPath, 'malformed replacement')
-  await index.index([{ source: 'codex', path: codexPath }])
-  const retained = index.search({ query: 'retain this text', limit: 1 })
-  index.close()
-  if (retained.length !== 1) throw new Error('failed artifact parse replaced the prior good index')
+  const exactOpenCode = parseOpencodeSession(openCodePath, 'populated')
+  if (exactOpenCode?.session.sessionId !== 'populated' || exactOpenCode.messages.length !== 2) {
+    throw new Error(`exact OpenCode read failed: ${JSON.stringify(exactOpenCode)}`)
+  }
 
   console.log('parser-correctness: all assertions passed')
 } finally {

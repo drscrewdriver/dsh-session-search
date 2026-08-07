@@ -1,28 +1,26 @@
 /**
- * Cross-agent session full-text search for DeepSeek Harness.
+ * Cross-agent session search for DeepSeek Harness.
  *
- * Indexes past conversations from dsh, Codex, Claude Code, pi, and OpenCode
- * into a local SQLite FTS5 (trigram) index and exposes two model-facing tools:
+ * Searches past conversations from dsh, Codex, Claude Code, pi, and OpenCode
+ * directly from their source artifacts and exposes two model-facing tools:
  *
- * - `agent_session_search` — full-text search across indexed sessions, grouped
+ * - `agent_session_search` — literal search across parsed sessions, grouped
  *   by session, returning the strongest match, a snippet, and a message window.
  * - `agent_session_read` — read one session's metadata and a message window.
  *
- * Everything is read-only: source artifacts are only opened for reading
- * (opencode.db is opened with `query_only`), and the index lives in its own
- * database file under the harness home.
+ * Everything is read-only: source artifacts are only opened for reading and
+ * opencode.db is opened with `query_only`. The plugin creates no database,
+ * index, or persistent cache of its own.
  *
  * @module @dsh-external/dsh-session-search
  */
 
 import type { Context } from 'cordis'
 import z from 'schemastery'
-import { join } from 'node:path'
-import { homedir } from 'node:os'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import { DEFAULT_MAX_MATCH_ROWS, SessionSearchDb } from './db.js'
-import { discoverFiles, defaultRoots, type SourceRoots } from './discovery.js'
+import { discoverFiles, type SourceRoots } from './discovery.js'
+import { readArtifactSession, searchArtifacts } from './search.js'
 import type { AgentSource } from './types.js'
 
 /** Cordis plugin name used by Loader diagnostics. */
@@ -37,32 +35,20 @@ export const DEFAULT_MAX_RESULTS = 10
 /** Default window size for session reads. */
 export const DEFAULT_READ_WINDOW = 10
 
-/** Default index database location under the harness home. */
-export function defaultDbPath(): string {
-  return join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'session-search.db')
-}
-
 /** Deployment-owned configuration. */
 export interface Config {
-  /** Index database path. Defaults to `$DSH_HOME/session-search.db`. */
-  dbPath?: string
-  /** Source families enabled for indexing. Defaults to all five. */
+  /** Source families enabled for scanning. Defaults to all five. */
   sources?: Partial<Record<AgentSource, boolean>>
   /** Per-source root overrides (defaults resolve under the home dir). */
   roots?: SourceRoots
   /** Maximum sessions returned by one `agent_session_search` call. Defaults to 10. */
   maxResults?: number
-  /** Maximum session-ranked database rows considered by one search. Defaults to 1000. */
-  maxMatchRows?: number
   /** Window size for `agent_session_read` and search windows. Defaults to 10. */
   readWindow?: number
-  /** Re-index before each search so fresh sessions are visible. Defaults to true. */
-  indexOnSearch?: boolean
 }
 
 /** Schemastery config for Loader defaults and generated configuration docs. */
 export const Config: z<Config> = z.object({
-  dbPath: z.string(),
   sources: z.object({
     dsh: z.boolean(),
     codex: z.boolean(),
@@ -77,20 +63,15 @@ export const Config: z<Config> = z.object({
     pi: z.string(),
     opencode: z.string(),
   }),
-    maxResults: z.number().step(1).min(1).max(100).default(DEFAULT_MAX_RESULTS),
-    maxMatchRows: z.number().step(1).min(1).max(100_000).default(DEFAULT_MAX_MATCH_ROWS),
+  maxResults: z.number().step(1).min(1).max(100).default(DEFAULT_MAX_RESULTS),
   readWindow: z.number().step(1).min(1).max(50).default(DEFAULT_READ_WINDOW),
-  indexOnSearch: z.boolean().default(true),
 })
 
 interface ResolvedConfig {
-  dbPath: string
   enabled: ReadonlySet<AgentSource>
   roots: SourceRoots
   maxResults: number
-  maxMatchRows: number
   readWindow: number
-  indexOnSearch: boolean
 }
 
 const TEXT_OUTPUT = {
@@ -101,7 +82,7 @@ const TEXT_OUTPUT = {
 const PROMPT_TEXT =
   'Use agent_session_search to find relevant work from prior sessions across dsh, Codex, '
   + 'Claude Code, pi, and OpenCode, then agent_session_read to view a full message window '
-  + 'of one hit. Search is full-text over user/assistant messages; tool output is excluded. '
+  + 'of one hit. Search is a case-insensitive literal scan over user/assistant messages; tool output is excluded. '
   + 'Results are read-only snapshots of past conversations on this machine.'
 
 const SOURCE_IDS: readonly AgentSource[] = ['dsh', 'codex', 'claude', 'pi', 'opencode']
@@ -109,27 +90,6 @@ const SOURCE_IDS: readonly AgentSource[] = ['dsh', 'codex', 'claude', 'pi', 'ope
 /** Register the search tools and their shared model guidance. */
 export function apply(ctx: Context, config: Config): void {
   const resolved = resolveConfig(config)
-  let db: SessionSearchDb | null = null
-
-  const getDb = (): SessionSearchDb => {
-    if (db === null) db = new SessionSearchDb(resolved.dbPath, resolved.enabled, {
-      maxMatchRows: resolved.maxMatchRows,
-    })
-    return db
-  }
-
-  const ensureIndexed = async (): Promise<void> => {
-    if (!resolved.indexOnSearch) return
-    const files = await discoverFiles(resolved.enabled, resolved.roots)
-    await getDb().index(files)
-  }
-
-  ctx.effect(() => {
-    return () => {
-      db?.close()
-      db = null
-    }
-  }, 'dsh-session-search.db')
 
   ctx.systemPrompt.section({
     name: 'tool:dsh-session-search',
@@ -139,17 +99,16 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'agent_session_search',
-    description: 'Search prior sessions from dsh, Codex, Claude Code, pi, and OpenCode on this machine; returns the strongest matching message per session with a snippet and message window.',
+    description: 'Search prior sessions from dsh, Codex, Claude Code, pi, and OpenCode with a case-insensitive literal scan; returns the strongest matching message per session with a snippet and message window.',
     parameters: {
-      query: { type: 'string', required: true, description: 'Full-text query over user and assistant messages.' },
+      query: { type: 'string', required: true, description: 'Literal text to find in user and assistant messages.' },
       sources: { type: 'array', items: { type: 'string', enum: SOURCE_IDS }, description: 'Restrict to these sources; omit for all.' },
       cwd: { type: 'string', description: 'Restrict to sessions whose working directory contains this substring.' },
       sort: { type: 'string', enum: ['relevance', 'newest', 'oldest'], description: 'Result ordering; defaults to relevance.' },
       limit: { type: 'number', description: `Maximum sessions to return (default ${resolved.maxResults}).` },
     },
     output: TEXT_OUTPUT,
-    execute: async (args) => {
-      await ensureIndexed()
+    execute: async (args, exec) => {
       const query = typeof args.query === 'string' ? args.query : ''
       const sources = args.sources ?? []
       const sort = args.sort === 'newest' || args.sort === 'oldest' ? args.sort : 'relevance'
@@ -157,7 +116,16 @@ export function apply(ctx: Context, config: Config): void {
         ? Math.min(args.limit, resolved.maxResults)
         : resolved.maxResults
       const cwd = typeof args.cwd === 'string' && args.cwd.length > 0 ? args.cwd : undefined
-      const hits = getDb().search({ query, sources, cwd, limit, sort, window: resolved.readWindow })
+      const enabled = sources.length === 0
+        ? resolved.enabled
+        : new Set<AgentSource>(sources.filter(source => resolved.enabled.has(source)))
+      const files = await discoverFiles(enabled, resolved.roots)
+      const hits = await searchArtifacts(
+        files,
+        enabled,
+        { query, sources, cwd, limit, sort, window: resolved.readWindow },
+        exec.signal,
+      )
       return JSON.stringify({
         query,
         count: hits.length,
@@ -185,7 +153,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'agent_session_read',
-    description: 'Read the metadata and a message window of one indexed session (source + sessionId from agent_session_search).',
+    description: 'Read the metadata and a message window of one discovered session (source + sessionId from agent_session_search).',
     parameters: {
       source: { type: 'string', enum: SOURCE_IDS, required: true, description: 'Source family of the session.' },
       sessionId: { type: 'string', required: true, description: 'Session id as returned by agent_session_search.' },
@@ -193,8 +161,7 @@ export function apply(ctx: Context, config: Config): void {
       window: { type: 'number', description: `Optional: window size (default ${resolved.readWindow}).` },
     },
     output: TEXT_OUTPUT,
-    execute: async (args) => {
-      await ensureIndexed()
+    execute: async (args, exec) => {
       const source = args.source
       const sessionId = args.sessionId
       const aroundSeq = typeof args.aroundSeq === 'number' && Number.isSafeInteger(args.aroundSeq)
@@ -203,7 +170,16 @@ export function apply(ctx: Context, config: Config): void {
       const window = typeof args.window === 'number' && Number.isSafeInteger(args.window) && args.window > 0
         ? Math.min(args.window, resolved.readWindow)
         : resolved.readWindow
-      const { session, messages } = getDb().readSession(source, sessionId, aroundSeq, window)
+      const enabled = resolved.enabled.has(source) ? new Set<AgentSource>([source]) : new Set<AgentSource>()
+      const files = await discoverFiles(enabled, resolved.roots)
+      const { session, messages } = await readArtifactSession(
+        files,
+        source,
+        sessionId,
+        aroundSeq,
+        window,
+        exec.signal,
+      )
       if (session === undefined) {
         return JSON.stringify({ error: `session not found: ${source}/${sessionId}`, source, sessionId }, null, 2)
       }
@@ -232,13 +208,10 @@ function resolveConfig(config: Config): ResolvedConfig {
     if (config.sources?.[source] !== false) enabled.add(source)
   }
   return {
-    dbPath: config.dbPath ?? defaultDbPath(),
     enabled,
     roots: config.roots ?? {},
     maxResults: config.maxResults ?? DEFAULT_MAX_RESULTS,
-    maxMatchRows: config.maxMatchRows ?? DEFAULT_MAX_MATCH_ROWS,
     readWindow: config.readWindow ?? DEFAULT_READ_WINDOW,
-    indexOnSearch: config.indexOnSearch ?? true,
   }
 }
 

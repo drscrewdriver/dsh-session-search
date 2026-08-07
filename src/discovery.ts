@@ -8,7 +8,7 @@
  */
 
 import { readdir, stat } from 'node:fs/promises'
-import { join, relative, sep } from 'node:path'
+import { basename, dirname, join, relative, sep } from 'node:path'
 import { homedir } from 'node:os'
 import type { AgentSource } from './types.js'
 
@@ -93,7 +93,10 @@ export async function discoverFiles(
     for (const path of await walkFiles(root, 4)) {
       const name = path.split(sep).pop() ?? ''
       if (name === 'session.jsonl.zstd' || name === 'main-session.jsonl.zstd' || name.endsWith('.jsonl.zstd')) {
-        files.push({ source: 'dsh', path, sessionId: bareSessionId(name) })
+        const sessionId = name === 'session.jsonl.zstd' || name === 'main-session.jsonl.zstd'
+          ? basename(dirname(path))
+          : bareSessionId(name)
+        files.push({ source: 'dsh', path, sessionId })
       }
     }
   }
@@ -142,7 +145,7 @@ export async function discoverFiles(
       const st = await stat(dbPath)
       if (st.isFile()) files.push({ source: 'opencode', path: dbPath, sessionId: 'opencode-db' })
     } catch {
-      // absent db: nothing to index
+      // absent source database: nothing to search
     }
   }
 

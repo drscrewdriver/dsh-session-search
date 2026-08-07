@@ -1,15 +1,15 @@
 # @dsh-external/dsh-session-search
 
-Cross-agent session full-text search plugin for DeepSeek Harness — index and search past conversations from dsh, Codex, Claude Code, pi, and OpenCode.
+Cross-agent session search plugin for DeepSeek Harness — directly scan past conversations from dsh, Codex, Claude Code, pi, and OpenCode without creating a derived database.
 
 ## Capabilities
 
 | Tool | Description |
 |---|---|
-| `agent_session_search` | Full-text search across indexed sessions: matching session + strongest message + snippet + message window; supports `sources`/`cwd`/`sort`/`limit` filters |
-| `agent_session_read` | Read one indexed session's metadata and a message window (`aroundSeq` targeting) |
+| `agent_session_search` | Case-insensitive literal search across current source artifacts: matching session + strongest message + snippet + message window; supports `sources`/`cwd`/`sort`/`limit` filters |
+| `agent_session_read` | Read one discovered session's metadata and a message window (`aroundSeq` targeting) |
 
-Full-text search uses SQLite FTS5 **trigram** tokenization: both English and Chinese substrings match (unicode61 cannot match CJK substrings).
+Search observes the current source artifacts on each call and uses a case-insensitive literal substring match. English, Chinese, punctuation, and short queries all follow the same rule. Relevance is intentionally basic: the message with the most occurrences represents each session, with recency as the tie-breaker.
 
 ## Supported session sources
 
@@ -21,7 +21,7 @@ Full-text search uses SQLite FTS5 **trigram** tokenization: both English and Chi
 | pi | `~/.pi/agent/sessions/**` | JSONL |
 | opencode | `~/.local/share/opencode/opencode.db` | SQLite read-only |
 
-All sources are **read-only**: session files are never modified; the index lives in its own database at `$DSH_HOME/session-search.db`.
+All sources are **read-only**: session files are never modified, and the plugin creates no database, index, or persistent cache. OpenCode's own database is opened read-only as a source artifact.
 
 ## Install (marisa / dshx)
 
@@ -40,40 +40,38 @@ Or install directly from a git URL. The plugin is mounted into `~/.dsh/config.ya
     - id: dsh-session-search
       name: '/absolute/path/to/dsh-session-search/lib/index.js'
       config:
-        dbPath: ~/.dsh/session-search.db
         sources: { dsh: true, codex: true, claude: true, pi: true, opencode: true }
         maxResults: 10
         readWindow: 10
-        indexOnSearch: true
 ```
 
 ## Configuration
 
 | Key | Default | Description |
 |---|---|---|
-| `dbPath` | `$DSH_HOME/session-search.db` | Index database path |
 | `sources` | all enabled | Per-source boolean switch (`dsh`/`codex`/`claude`/`pi`/`opencode`) |
 | `roots` | per-source home defaults | Per-source root override |
 | `maxResults` | 10 | Max sessions per search |
 | `readWindow` | 10 | Default window for `agent_session_read` |
-| `indexOnSearch` | true | Incremental re-index before each search |
 
 ## Development
 
 ```sh
 ./scripts/build.sh   # compile src → lib with the dsh checkout's tsc (lib/ committed)
-node tests/smoke.mjs # smoke test: index real sessions and search
+node tests/smoke.mjs # smoke test: scan real sessions and search
 ```
 
 peerDependencies are provided by the host dsh's node_modules (`cordis`, `@deepseek-ai/dsh-tools`, `@deepseek-ai/dsh-system-prompt`, …); the build script creates the symlinks.
 
 ## Implementation notes
 
-- Parsers are defensive: oversized/corrupt/unreadable files are skipped without failing the whole index.
-- dsh session logs are **concatenated-frame zstd streams** (one independent frame per appended event batch): frame boundaries are located with a structural scan, then decoded one frame at a time; a torn final frame (interrupted write) is skipped and picked up by the next index pass.
-- Incremental indexing skips unchanged files by `(mtime, size)`; vanished sessions are cleaned up.
-- FTS sync is maintained explicitly by rowid (the FTS5 `'delete'` special command is unreliable on some SQLite builds).
-- Short queries (<3 searchable chars) fall back to LIKE exact matching; snippets fall back to the hit message body.
+- Parsers are defensive: oversized, corrupt, or unreadable files are skipped without failing the whole scan.
+- dsh session logs are **concatenated-frame zstd streams** (one independent frame per appended event batch): frame boundaries are located with a structural scan, then decoded one frame at a time; a torn final frame (interrupted write) is skipped on that call.
+- `sources` is applied before discovery. For canonical plain JSONL sources, safe single-line queries use `rg --fixed-strings --ignore-case` only to select candidate files; escaped queries skip this optimization. Every candidate is parsed and matched again, so raw metadata never becomes a result.
+- Search processes one parsed session at a time and retains only bounded Top-K hits. DSH concatenated Zstd frames are decompressed and consumed one frame at a time instead of materializing the complete decoded log.
+- `agent_session_read` tries the source-native artifact id first and falls back to a source-scoped scan only when an external format does not expose a direct mapping. OpenCode selects the exact source row.
+- Every call observes current source state. There is no index lifecycle or stale derived state; a broad DSH search must still decompress the complete DSH corpus.
+- Matching is literal and case-insensitive. Results group by session, rank the strongest message by occurrence count, and use timestamps for stable tie-breaking.
 
 ## License
 

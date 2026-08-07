@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-session-search",
-  "description": "Cross-agent session full-text search for DeepSeek Harness: index and search past conversations from dsh, Codex, Claude Code, pi, and OpenCode (SQLite FTS5 trigram, read-only).",
+  "description": "Index-free cross-agent session search for DeepSeek Harness: directly scan past dsh, Codex, Claude Code, pi, and OpenCode conversations read-only.",
   "version": "0.1.0",
   "private": true,
   "type": "module",

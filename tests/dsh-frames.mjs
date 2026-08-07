@@ -3,7 +3,7 @@
  * Regression test: dsh session logs are concatenated zstd frames — one
  * independent frame per appended event batch (the layout owned by
  * `dsh-session-persistence-jsonl`). A single `zstdDecompressSync` call
- * decodes only the first frame, so pre-fix `parseDsh()` indexed dsh sessions
+ * decodes only the first frame, so pre-fix `parseDsh()` searched dsh sessions
  * with zero messages. Frames must be scanned structurally and decoded one at
  * a time; a torn final frame (interrupted write) is skipped, not fatal.
  */
