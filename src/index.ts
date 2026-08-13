@@ -15,8 +15,8 @@
  * @module @dsh-external/dsh-session-search
  */
 
-import type { Context } from 'cordis'
-import z from 'schemastery'
+import type { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { discoverFiles, type SourceRoots } from './discovery.js'
@@ -147,7 +147,7 @@ export function apply(ctx: Context, config: Config): void {
             text: clip(m.content),
           })),
         })),
-      }, null, 2)
+      }, null, 2) ?? ''
     },
   }))
 
@@ -181,7 +181,7 @@ export function apply(ctx: Context, config: Config): void {
         exec.signal,
       )
       if (session === undefined) {
-        return JSON.stringify({ error: `session not found: ${source}/${sessionId}`, source, sessionId }, null, 2)
+        return JSON.stringify({ error: `session not found: ${source}/${sessionId}`, source, sessionId }, null, 2) ?? ''
       }
       return JSON.stringify({
         source: session.source,
@@ -196,7 +196,7 @@ export function apply(ctx: Context, config: Config): void {
           role: m.role,
           text: clip(m.content),
         })),
-      }, null, 2)
+      }, null, 2) ?? ''
     },
   }))
 }

@@ -14,8 +14,8 @@
  *
  * @module @dsh-external/dsh-session-search
  */
-import type { Context } from 'cordis';
-import z from 'schemastery';
+import type { Context } from '@deepseek-ai/cordis';
+import z from '@deepseek-ai/schemastery';
 import { type SourceRoots } from './discovery.js';
 import type { AgentSource } from './types.js';
 /** Cordis plugin name used by Loader diagnostics. */
