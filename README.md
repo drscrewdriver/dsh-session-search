@@ -1,8 +1,22 @@
-# @dsh-external/dsh-session-search
+# dsh-session-search
 
 Cross-agent session search plugin for DeepSeek Harness — directly scan past conversations from dsh, Codex, Claude Code, pi, and OpenCode without creating a derived database.
 
-[中文](README.zh-CN.md)
+- [English README](./README.md)
+- [中文 README](./README.zh-CN.md)
+- [日本語 README](./README.ja.md)
+- [한국어 README](./README.ko.md)
+- [Installation guide](./INSTALL.md)
+- [中文安装指南](./INSTALL.zh.md)
+- [日本語インストールガイド](./INSTALL.ja.md)
+- [한국어 설치 안내](./INSTALL.ko.md)
+- [Changelog](./CHANGELOG.md)
+- [日本語 changelog](./CHANGELOG.ja.md)
+- [한국어 changelog](./CHANGELOG.ko.md)
+
+> **Compatibility note:** v0.1.0 ships Japanese (`ja`) and Korean (`ko`) dictionaries, but the current official DSH releases expose only `zh` and `en` through `LocaleRuntime`. On stock DSH, selecting `ja` or `ko` fails with `locale "<id>" is not registered`.
+>
+> **Host compatibility:** tested DSH hosts are listed as an exact per-rc enumeration (no ranges/caret) in `engines.dsh` and every `@deepseek-ai/dsh-*` peer: `0.1.0-rc.2 || 0.1.0-rc.3 || 0.1.0-rc.6 || 0.1.0-rc.7 || 0.1.0-rc.8 || 0.1.1-rc.1 || 0.1.1-rc.2 || 0.1.2-rc.1 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.5-rc.3 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1`.
 
 ## Capabilities
 
@@ -28,7 +42,7 @@ All sources are **read-only**: session files are never modified, and the plugin 
 ## Install (marisa / dshx)
 
 ```sh
-git clone https://github.com/dsh-external/dsh-session-search.git
+git clone https://github.com/Tieboyh/dsh-session-search.git
 dshx install dsh-session-search ./dsh-session-search
 ```
 

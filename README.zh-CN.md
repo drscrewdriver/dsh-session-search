@@ -1,8 +1,22 @@
-# @dsh-external/dsh-session-search
+# dsh-session-search
 
 跨工具会话搜索插件（DeepSeek Harness 外部插件）——不创建派生数据库，直接扫描本机 dsh、Codex、Claude Code、pi、OpenCode 的历史会话。
 
-[English](README.md)
+- [English README](./README.md)
+- [中文 README](./README.zh-CN.md)
+- [日本語 README](./README.ja.md)
+- [한국어 README](./README.ko.md)
+- [Installation guide](./INSTALL.md)
+- [中文安装指南](./INSTALL.zh.md)
+- [日本語インストールガイド](./INSTALL.ja.md)
+- [한국어 설치 안내](./INSTALL.ko.md)
+- [Changelog](./CHANGELOG.md)
+- [日本語 changelog](./CHANGELOG.ja.md)
+- [한국어 changelog](./CHANGELOG.ko.md)
+
+> **兼容性说明：** v0.1.0 已包含日语（`ja`）和韩语（`ko`）字典，但当前官方 DSH 只通过 `LocaleRuntime` 提供 `zh` 和 `en`。在原版 DSH 中选择 `ja` 或 `ko` 会失败，并提示 `locale "<id>" is not registered`。
+>
+> **宿主兼容性：** 已测试的 DSH 宿主以逐 rc 精确枚举（无区间/caret）列于 `engines.dsh` 与全部 `@deepseek-ai/dsh-*` peer：`0.1.0-rc.2 || 0.1.0-rc.3 || 0.1.0-rc.6 || 0.1.0-rc.7 || 0.1.0-rc.8 || 0.1.1-rc.1 || 0.1.1-rc.2 || 0.1.2-rc.1 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.5-rc.3 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.1`。
 
 ## 能力
 
@@ -28,7 +42,7 @@
 ## 安装（marisa / dshx）
 
 ```sh
-git clone https://github.com/dsh-external/dsh-session-search.git
+git clone https://github.com/Tieboyh/dsh-session-search.git
 dshx install dsh-session-search ./dsh-session-search
 ```
 
